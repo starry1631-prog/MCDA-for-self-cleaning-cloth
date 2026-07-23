@@ -1,0 +1,1108 @@
+"""
+Generate Fig. S3: Joint frontier-cost stress test
+
+Outputs:
+1. Fig_S3a_DAC_cost_stress.png
+2. Fig_S3b_DC_cost_stress.png
+3. Fig_S3_combined.png
+4. Fig_S3_cost_stress_results.csv
+5. Fig_S3_transition_summary.txt
+
+Required packages:
+    pip install numpy pandas matplotlib pillow
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.ticker import ScalarFormatter
+from PIL import Image
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+OUTPUT_DIR = Path("Fig_S3_outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MULTIPLIERS = np.round(np.arange(1.00, 100.00 + 0.01, 0.01), 2)
+
+WEIGHT_STEP = 0.01
+
+# Use the normalization anchor of US$0.01 g^-1 for
+# Hybrid Padding-Squeezing, not its calculated US$0.004 value.
+FORMULATION_NAMES = [
+    "TiO₂ Two-Step Dipping",
+    "TiO₂ Alkaline-Hydrolysis",
+    "Hybrid Padding-Squeezing",
+    "Hybrid In-Situ",
+    "ZnO Starch",
+    "ZnO SDS",
+    "Ag Two-Step",
+    "Ag One-Step",
+]
+
+DURABILITY = np.array([
+    0.459,
+    0.772,
+    0.623,
+    0.738,
+    0.850,
+    0.564,
+    0.917,
+    0.911,
+], dtype=float)
+
+# NaN means that the formulation is excluded from the
+# three-criterion DAC analysis.
+ANTIBACTERIAL = np.array([
+    np.nan,
+    np.nan,
+    0.999,
+    0.993,
+    0.395,
+    0.802,
+    0.997,
+    0.929,
+], dtype=float)
+
+BASE_COST = np.array([
+    2.70,
+    1.66,
+    0.01,
+    0.46,
+    20.01,
+    1.14,
+    0.13,
+    4.28,
+], dtype=float)
+
+HYBRID_PADDING_INDEX = FORMULATION_NAMES.index(
+    "Hybrid Padding-Squeezing"
+)
+HYBRID_IN_SITU_INDEX = FORMULATION_NAMES.index(
+    "Hybrid In-Situ"
+)
+AG_TWO_STEP_INDEX = FORMULATION_NAMES.index(
+    "Ag Two-Step"
+)
+
+BASELINE_FRONTIER_INDICES = {
+    HYBRID_PADDING_INDEX,
+    AG_TWO_STEP_INDEX,
+}
+
+
+# ============================================================
+# 2. VALIDATION
+# ============================================================
+
+def validate_input_data() -> None:
+    """Check that the supplied score arrays are internally valid."""
+
+    n = len(FORMULATION_NAMES)
+
+    if not (
+        len(DURABILITY)
+        == len(ANTIBACTERIAL)
+        == len(BASE_COST)
+        == n
+    ):
+        raise ValueError(
+            "The formulation names and data arrays have different lengths."
+        )
+
+    if np.any((DURABILITY < 0) | (DURABILITY > 1)):
+        raise ValueError("Durability scores must lie between 0 and 1.")
+
+    available_antibacterial = ANTIBACTERIAL[~np.isnan(ANTIBACTERIAL)]
+
+    if np.any(
+        (available_antibacterial < 0)
+        | (available_antibacterial > 1)
+    ):
+        raise ValueError(
+            "Antibacterial scores must lie between 0 and 1."
+        )
+
+    if np.any(BASE_COST <= 0):
+        raise ValueError(
+            "All raw-material costs must be greater than zero "
+            "because logarithms are used."
+        )
+
+
+# ============================================================
+# 3. COST NORMALIZATION
+# ============================================================
+
+def calculate_cost_scores(costs: np.ndarray) -> np.ndarray:
+    """
+    Apply logarithmic reverse min-max normalization.
+
+    Highest score = least expensive formulation.
+    Lowest score = most expensive formulation.
+    """
+
+    if np.any(costs <= 0):
+        raise ValueError(
+            "All costs must be positive for logarithmic normalization."
+        )
+
+    log_costs = np.log(costs)
+    log_min = np.min(log_costs)
+    log_max = np.max(log_costs)
+
+    denominator = log_max - log_min
+
+    if np.isclose(denominator, 0.0):
+        raise ValueError(
+            "All costs are identical, so cost normalization is undefined."
+        )
+
+    return (log_max - log_costs) / denominator
+
+
+def apply_joint_cost_multiplier(multiplier: float) -> np.ndarray:
+    """
+    Simultaneously inflate the costs of:
+    - Hybrid Padding-Squeezing
+    - Ag Two-Step
+    """
+
+    costs = BASE_COST.copy()
+
+    costs[HYBRID_PADDING_INDEX] *= multiplier
+    costs[AG_TWO_STEP_INDEX] *= multiplier
+
+    return costs
+
+
+# ============================================================
+# 4. WEIGHT GRIDS
+# ============================================================
+
+def generate_dc_weights(step: float = 0.01) -> np.ndarray:
+    """Generate durability weights from 0 to 1."""
+
+    number_of_intervals = int(round(1.0 / step))
+
+    return np.linspace(
+        0.0,
+        1.0,
+        number_of_intervals + 1,
+    )
+
+
+def generate_dac_weights(step: float = 0.01) -> np.ndarray:
+    """
+    Generate all feasible three-criterion weights:
+
+        w_D + w_A + w_C = 1
+        w_D, w_A, w_C >= 0
+
+    At step = 0.01, this produces 5,151 combinations.
+    """
+
+    number_of_intervals = int(round(1.0 / step))
+    combinations: list[tuple[float, float, float]] = []
+
+    for durability_integer in range(number_of_intervals + 1):
+        antibacterial_maximum = (
+            number_of_intervals - durability_integer
+        )
+
+        for antibacterial_integer in range(
+            antibacterial_maximum + 1
+        ):
+            cost_integer = (
+                number_of_intervals
+                - durability_integer
+                - antibacterial_integer
+            )
+
+            combinations.append(
+                (
+                    durability_integer / number_of_intervals,
+                    antibacterial_integer / number_of_intervals,
+                    cost_integer / number_of_intervals,
+                )
+            )
+
+    weights = np.asarray(combinations, dtype=float)
+
+    expected_count = (
+        (number_of_intervals + 1)
+        * (number_of_intervals + 2)
+        // 2
+    )
+
+    if len(weights) != expected_count:
+        raise RuntimeError(
+            f"Expected {expected_count} DAC combinations, "
+            f"but generated {len(weights)}."
+        )
+
+    return weights
+
+
+# ============================================================
+# 5. WINNING-SHARE CALCULATIONS
+# ============================================================
+
+def calculate_fractional_winning_shares(
+    index_values: np.ndarray,
+    tolerance: float = 1e-12,
+) -> np.ndarray:
+    """
+    Calculate winning shares.
+
+    If multiple formulations tie exactly, the winning point is
+    divided equally among them.
+    """
+
+    maximum_values = np.max(
+        index_values,
+        axis=1,
+        keepdims=True,
+    )
+
+    winning_mask = np.isclose(
+        index_values,
+        maximum_values,
+        rtol=0.0,
+        atol=tolerance,
+    )
+
+    number_of_winners = np.sum(
+        winning_mask,
+        axis=1,
+        keepdims=True,
+    )
+
+    fractional_wins = (
+        winning_mask.astype(float) / number_of_winners
+    )
+
+    shares = (
+        np.sum(fractional_wins, axis=0)
+        / index_values.shape[0]
+        * 100.0
+    )
+
+    return shares
+
+
+def calculate_dc_winning_shares(
+    cost_scores: np.ndarray,
+    dc_weights: np.ndarray,
+) -> np.ndarray:
+    """Calculate DC winning shares for all eight formulations."""
+
+    durability_weights = dc_weights[:, np.newaxis]
+    cost_weights = 1.0 - durability_weights
+
+    index_values = (
+        durability_weights * DURABILITY[np.newaxis, :]
+        + cost_weights * cost_scores[np.newaxis, :]
+    )
+
+    return calculate_fractional_winning_shares(index_values)
+
+
+def calculate_dac_winning_shares(
+    cost_scores: np.ndarray,
+    dac_weights: np.ndarray,
+) -> np.ndarray:
+    """
+    Calculate DAC winning shares for formulations with
+    compatible antibacterial data.
+    """
+
+    included_indices = np.where(
+        ~np.isnan(ANTIBACTERIAL)
+    )[0]
+
+    durability_scores = DURABILITY[included_indices]
+    antibacterial_scores = ANTIBACTERIAL[included_indices]
+    included_cost_scores = cost_scores[included_indices]
+
+    durability_weights = dac_weights[:, 0][:, np.newaxis]
+    antibacterial_weights = dac_weights[:, 1][:, np.newaxis]
+    cost_weights = dac_weights[:, 2][:, np.newaxis]
+
+    index_values = (
+        durability_weights
+        * durability_scores[np.newaxis, :]
+        + antibacterial_weights
+        * antibacterial_scores[np.newaxis, :]
+        + cost_weights
+        * included_cost_scores[np.newaxis, :]
+    )
+
+    included_shares = calculate_fractional_winning_shares(
+        index_values
+    )
+
+    all_shares = np.zeros(
+        len(FORMULATION_NAMES),
+        dtype=float,
+    )
+
+    all_shares[included_indices] = included_shares
+
+    return all_shares
+
+
+# ============================================================
+# 6. PARETO-FRONT CALCULATION
+# ============================================================
+
+def find_pareto_front(
+    criterion_matrix: np.ndarray,
+    tolerance: float = 1e-12,
+) -> np.ndarray:
+    """
+    Return a Boolean array indicating Pareto-front membership.
+
+    All criteria are assumed to be maximized.
+    """
+
+    number_of_formulations = criterion_matrix.shape[0]
+    is_pareto = np.ones(number_of_formulations, dtype=bool)
+
+    for candidate_index in range(number_of_formulations):
+        candidate = criterion_matrix[candidate_index]
+
+        for competitor_index in range(number_of_formulations):
+            if candidate_index == competitor_index:
+                continue
+
+            competitor = criterion_matrix[competitor_index]
+
+            at_least_as_good = np.all(
+                competitor >= candidate - tolerance
+            )
+
+            strictly_better = np.any(
+                competitor > candidate + tolerance
+            )
+
+            if at_least_as_good and strictly_better:
+                is_pareto[candidate_index] = False
+                break
+
+    return is_pareto
+
+
+def calculate_dc_pareto_membership(
+    cost_scores: np.ndarray,
+) -> np.ndarray:
+    """Pareto membership in durability-cost criterion space."""
+
+    criterion_matrix = np.column_stack(
+        [DURABILITY, cost_scores]
+    )
+
+    return find_pareto_front(criterion_matrix)
+
+
+def calculate_dac_pareto_membership(
+    cost_scores: np.ndarray,
+) -> np.ndarray:
+    """
+    Pareto membership in durability-antibacterial-cost space.
+
+    Formulations without antibacterial data are marked False.
+    """
+
+    included_indices = np.where(
+        ~np.isnan(ANTIBACTERIAL)
+    )[0]
+
+    criterion_matrix = np.column_stack(
+        [
+            DURABILITY[included_indices],
+            ANTIBACTERIAL[included_indices],
+            cost_scores[included_indices],
+        ]
+    )
+
+    included_membership = find_pareto_front(
+        criterion_matrix
+    )
+
+    all_membership = np.zeros(
+        len(FORMULATION_NAMES),
+        dtype=bool,
+    )
+
+    all_membership[included_indices] = included_membership
+
+    return all_membership
+
+
+# ============================================================
+# 7. COMPLETE STRESS TEST
+# ============================================================
+
+def run_stress_test() -> tuple[
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Run the full k = 1.00 to 100.00 stress test."""
+
+    dc_weights = generate_dc_weights(WEIGHT_STEP)
+    dac_weights = generate_dac_weights(WEIGHT_STEP)
+
+    print(
+        f"DC weight combinations: {len(dc_weights):,}"
+    )
+    print(
+        f"DAC weight combinations: {len(dac_weights):,}"
+    )
+    print(
+        f"Cost multipliers: {len(MULTIPLIERS):,}"
+    )
+
+    result_rows: list[dict[str, float]] = []
+
+    dc_pareto_history = np.zeros(
+        (
+            len(MULTIPLIERS),
+            len(FORMULATION_NAMES),
+        ),
+        dtype=bool,
+    )
+
+    dac_pareto_history = np.zeros_like(
+        dc_pareto_history
+    )
+
+    for multiplier_position, multiplier in enumerate(
+        MULTIPLIERS
+    ):
+        adjusted_costs = apply_joint_cost_multiplier(
+            multiplier
+        )
+
+        cost_scores = calculate_cost_scores(
+            adjusted_costs
+        )
+
+        dc_shares = calculate_dc_winning_shares(
+            cost_scores,
+            dc_weights,
+        )
+
+        dac_shares = calculate_dac_winning_shares(
+            cost_scores,
+            dac_weights,
+        )
+
+        dc_pareto_history[
+            multiplier_position
+        ] = calculate_dc_pareto_membership(cost_scores)
+
+        dac_pareto_history[
+            multiplier_position
+        ] = calculate_dac_pareto_membership(cost_scores)
+
+        row: dict[str, float] = {
+            "Multiplier_k": multiplier,
+            "Hybrid_Padding_Squeezing_cost":
+                adjusted_costs[HYBRID_PADDING_INDEX],
+            "Ag_Two_Step_cost":
+                adjusted_costs[AG_TWO_STEP_INDEX],
+        }
+
+        for formulation_index, formulation_name in enumerate(
+            FORMULATION_NAMES
+        ):
+            safe_name = (
+                formulation_name
+                .replace(" ", "_")
+                .replace("-", "_")
+                .replace("₂", "2")
+            )
+
+            row[
+                f"DAC_{safe_name}"
+            ] = dac_shares[formulation_index]
+
+            row[
+                f"DC_{safe_name}"
+            ] = dc_shares[formulation_index]
+
+        result_rows.append(row)
+
+        if (
+            multiplier_position % 1000 == 0
+            or multiplier_position
+            == len(MULTIPLIERS) - 1
+        ):
+            print(
+                f"Completed multiplier "
+                f"{multiplier:.2f} / 100.00"
+            )
+
+    results = pd.DataFrame(result_rows)
+
+    return (
+        results,
+        dc_pareto_history,
+        dac_pareto_history,
+    )
+
+
+# ============================================================
+# 8. TRANSITION SUMMARIES
+# ============================================================
+
+def first_true_position(
+    condition: np.ndarray,
+) -> int | None:
+    """Return the first position where a Boolean condition is true."""
+
+    positions = np.flatnonzero(condition)
+
+    if positions.size == 0:
+        return None
+
+    return int(positions[0])
+
+
+def first_outside_frontier_pareto_entry(
+    pareto_history: np.ndarray,
+) -> tuple[float, str] | None:
+    """
+    Identify the first multiplier at which a formulation outside
+    the baseline pair enters the Pareto front.
+    """
+
+    outside_indices = [
+        index
+        for index in range(len(FORMULATION_NAMES))
+        if index not in BASELINE_FRONTIER_INDICES
+    ]
+
+    for multiplier_position, multiplier in enumerate(
+        MULTIPLIERS
+    ):
+        current_membership = pareto_history[
+            multiplier_position
+        ]
+
+        for formulation_index in outside_indices:
+            if current_membership[formulation_index]:
+                return (
+                    float(multiplier),
+                    FORMULATION_NAMES[formulation_index],
+                )
+
+    return None
+
+
+def identify_largest_share_transition(
+    share_matrix: np.ndarray,
+    target_index: int,
+) -> int | None:
+    """
+    Find the first multiplier at which the target formulation
+    has the largest winning share.
+
+    A tolerance is used to avoid treating tiny numerical
+    differences as meaningful.
+    """
+
+    target_shares = share_matrix[:, target_index]
+    maximum_shares = np.max(share_matrix, axis=1)
+
+    return first_true_position(
+        target_shares >= maximum_shares - 1e-12
+    )
+
+
+def build_transition_summary(
+    results: pd.DataFrame,
+    dc_pareto_history: np.ndarray,
+    dac_pareto_history: np.ndarray,
+) -> str:
+    """Generate a text summary for checking the manuscript."""
+
+    dc_columns = [
+        column
+        for column in results.columns
+        if column.startswith("DC_")
+    ]
+
+    dac_columns = [
+        column
+        for column in results.columns
+        if column.startswith("DAC_")
+    ]
+
+    dc_share_matrix = results[dc_columns].to_numpy()
+    dac_share_matrix = results[dac_columns].to_numpy()
+
+    target_safe_name = (
+        FORMULATION_NAMES[HYBRID_IN_SITU_INDEX]
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("₂", "2")
+    )
+
+    dc_target_column = f"DC_{target_safe_name}"
+    dac_target_column = f"DAC_{target_safe_name}"
+
+    dc_target = results[dc_target_column].to_numpy()
+    dac_target = results[dac_target_column].to_numpy()
+
+    dc_nonzero_position = first_true_position(
+        dc_target > 1e-12
+    )
+    dac_nonzero_position = first_true_position(
+        dac_target > 1e-12
+    )
+
+    dc_five_position = first_true_position(
+        dc_target >= 5.0
+    )
+    dac_five_position = first_true_position(
+        dac_target >= 5.0
+    )
+
+    dc_largest_position = identify_largest_share_transition(
+        dc_share_matrix,
+        HYBRID_IN_SITU_INDEX,
+    )
+
+    # DAC column order excludes the two formulations without
+    # antibacterial data from the numerical matrix order.
+    dac_target_matrix_index = dac_columns.index(
+        dac_target_column
+    )
+
+    dac_largest_position = identify_largest_share_transition(
+        dac_share_matrix,
+        dac_target_matrix_index,
+    )
+
+    dc_majority_position = first_true_position(
+        dc_target > 50.0
+    )
+    dac_majority_position = first_true_position(
+        dac_target > 50.0
+    )
+
+    dc_pareto_entry = first_outside_frontier_pareto_entry(
+        dc_pareto_history
+    )
+
+    dac_pareto_entry = first_outside_frontier_pareto_entry(
+        dac_pareto_history
+    )
+
+    def describe_position(
+        position: int | None,
+        values: np.ndarray,
+    ) -> str:
+        if position is None:
+            return "not reached"
+
+        multiplier = results.loc[
+            position,
+            "Multiplier_k",
+        ]
+
+        share = values[position]
+
+        hybrid_cost = results.loc[
+            position,
+            "Hybrid_Padding_Squeezing_cost",
+        ]
+
+        ag_cost = results.loc[
+            position,
+            "Ag_Two_Step_cost",
+        ]
+
+        return (
+            f"k = {multiplier:.2f}; "
+            f"share = {share:.3f}%; "
+            f"Hybrid Padding-Squeezing cost = "
+            f"US${hybrid_cost:.4f} g^-1; "
+            f"Ag Two-Step cost = "
+            f"US${ag_cost:.4f} g^-1"
+        )
+
+    lines = [
+        "FIGURE S3 TRANSITION SUMMARY",
+        "=" * 40,
+        "",
+        "Baseline winning shares:",
+        (
+            f"DC: Hybrid Padding-Squeezing = "
+            f"{results.loc[0, 'DC_Hybrid_Padding_Squeezing']:.3f}%; "
+            f"Ag Two-Step = "
+            f"{results.loc[0, 'DC_Ag_Two_Step']:.3f}%"
+        ),
+        (
+            f"DAC: Hybrid Padding-Squeezing = "
+            f"{results.loc[0, 'DAC_Hybrid_Padding_Squeezing']:.3f}%; "
+            f"Ag Two-Step = "
+            f"{results.loc[0, 'DAC_Ag_Two_Step']:.3f}%"
+        ),
+        "",
+        "First outside formulation entering Pareto front:",
+        f"DC: {dc_pareto_entry}",
+        f"DAC: {dac_pareto_entry}",
+        "",
+        "Hybrid In-Situ first non-zero winning region:",
+        f"DC: {describe_position(dc_nonzero_position, dc_target)}",
+        f"DAC: {describe_position(dac_nonzero_position, dac_target)}",
+        "",
+        "Hybrid In-Situ first reaches at least 5%:",
+        f"DC: {describe_position(dc_five_position, dc_target)}",
+        f"DAC: {describe_position(dac_five_position, dac_target)}",
+        "",
+        "Hybrid In-Situ first has largest winning share:",
+        f"DC: {describe_position(dc_largest_position, dc_target)}",
+        f"DAC: {describe_position(dac_largest_position, dac_target)}",
+        "",
+        "Hybrid In-Situ first exceeds 50%:",
+        f"DC: {describe_position(dc_majority_position, dc_target)}",
+        f"DAC: {describe_position(dac_majority_position, dac_target)}",
+        "",
+        "Winning shares at k = 100:",
+    ]
+
+    final_position = len(results) - 1
+
+    for formulation_name in FORMULATION_NAMES:
+        safe_name = (
+            formulation_name
+            .replace(" ", "_")
+            .replace("-", "_")
+            .replace("₂", "2")
+        )
+
+        dc_value = results.loc[
+            final_position,
+            f"DC_{safe_name}",
+        ]
+
+        dac_value = results.loc[
+            final_position,
+            f"DAC_{safe_name}",
+        ]
+
+        if dc_value > 0 or dac_value > 0:
+            lines.append(
+                f"{formulation_name}: "
+                f"DC = {dc_value:.3f}%; "
+                f"DAC = {dac_value:.3f}%"
+            )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 9. PLOTTING
+# ============================================================
+
+def get_nonzero_formulations(
+    results: pd.DataFrame,
+    model_prefix: str,
+) -> list[str]:
+    """
+    Return formulations that have a non-zero winning share at
+    any tested multiplier.
+    """
+
+    selected: list[str] = []
+
+    for formulation_name in FORMULATION_NAMES:
+        safe_name = (
+            formulation_name
+            .replace(" ", "_")
+            .replace("-", "_")
+            .replace("₂", "2")
+        )
+
+        column = f"{model_prefix}_{safe_name}"
+
+        if results[column].max() > 1e-12:
+            selected.append(formulation_name)
+
+    return selected
+
+
+def save_panel(
+    results: pd.DataFrame,
+    model_prefix: str,
+    output_path: Path,
+    panel_label: str,
+    analysis_name: str,
+) -> None:
+    """Save one high-resolution figure panel."""
+
+    figure, axis = plt.subplots(
+        figsize=(7.2, 5.2)
+    )
+
+    formulations_to_plot = get_nonzero_formulations(
+        results,
+        model_prefix,
+    )
+
+    x_values = results["Multiplier_k"].to_numpy()
+
+    for formulation_name in formulations_to_plot:
+        safe_name = (
+            formulation_name
+            .replace(" ", "_")
+            .replace("-", "_")
+            .replace("₂", "2")
+        )
+
+        y_values = results[
+            f"{model_prefix}_{safe_name}"
+        ].to_numpy()
+
+        axis.plot(
+            x_values,
+            y_values,
+            linewidth=1.8,
+            label=formulation_name,
+        )
+
+    axis.axhline(
+        y=5.0,
+        linestyle="--",
+        linewidth=1.2,
+    )
+
+    axis.set_xscale("log")
+    axis.set_xlim(1.0, 100.0)
+    axis.set_ylim(0.0, 100.0)
+
+    axis.set_xticks(
+        [1, 2, 5, 10, 20, 50, 100]
+    )
+
+    axis.xaxis.set_major_formatter(
+        ScalarFormatter()
+    )
+
+    axis.set_xlabel(
+        "Common cost-inflation multiplier, $k$"
+    )
+
+    axis.set_ylabel(
+        "Winning share of tested weight space (%)"
+    )
+
+    axis.grid(
+        True,
+        which="major",
+        linewidth=0.5,
+        alpha=0.35,
+    )
+
+    axis.legend(
+        frameon=False,
+        loc="best",
+        fontsize=8,
+    )
+
+    axis.text(
+        0.01,
+        0.98,
+        panel_label,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+    )
+
+    axis.text(
+        0.99,
+        0.02,
+        analysis_name,
+        transform=axis.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+    )
+
+    figure.tight_layout()
+
+    figure.savefig(
+        output_path,
+        dpi=600,
+        bbox_inches="tight",
+    )
+
+    plt.close(figure)
+
+
+def combine_panels(
+    left_path: Path,
+    right_path: Path,
+    output_path: Path,
+) -> None:
+    """
+    Combine the two separately generated panels into one
+    horizontal image without resampling them.
+    """
+
+    with Image.open(left_path) as left_image:
+        left = left_image.convert("RGB")
+
+    with Image.open(right_path) as right_image:
+        right = right_image.convert("RGB")
+
+    target_height = max(left.height, right.height)
+
+    if left.height != target_height:
+        blank = Image.new(
+            "RGB",
+            (left.width, target_height),
+            "white",
+        )
+        blank.paste(
+            left,
+            (0, (target_height - left.height) // 2),
+        )
+        left = blank
+
+    if right.height != target_height:
+        blank = Image.new(
+            "RGB",
+            (right.width, target_height),
+            "white",
+        )
+        blank.paste(
+            right,
+            (0, (target_height - right.height) // 2),
+        )
+        right = blank
+
+    gap_width = 80
+
+    combined = Image.new(
+        "RGB",
+        (
+            left.width + gap_width + right.width,
+            target_height,
+        ),
+        "white",
+    )
+
+    combined.paste(left, (0, 0))
+    combined.paste(
+        right,
+        (left.width + gap_width, 0),
+    )
+
+    combined.save(
+        output_path,
+        dpi=(600, 600),
+    )
+
+
+# ============================================================
+# 10. MAIN
+# ============================================================
+
+def main() -> None:
+    validate_input_data()
+
+    results, dc_pareto, dac_pareto = run_stress_test()
+
+    csv_path = (
+        OUTPUT_DIR
+        / "Fig_S3_cost_stress_results.csv"
+    )
+
+    results.to_csv(
+        csv_path,
+        index=False,
+    )
+
+    panel_a_path = (
+        OUTPUT_DIR
+        / "Fig_S3a_DAC_cost_stress.png"
+    )
+
+    panel_b_path = (
+        OUTPUT_DIR
+        / "Fig_S3b_DC_cost_stress.png"
+    )
+
+    combined_path = (
+        OUTPUT_DIR
+        / "Fig_S3_combined.png"
+    )
+
+    save_panel(
+        results=results,
+        model_prefix="DAC",
+        output_path=panel_a_path,
+        panel_label="(a)",
+        analysis_name=(
+            "Durability–Antibacterial–Cost"
+        ),
+    )
+
+    save_panel(
+        results=results,
+        model_prefix="DC",
+        output_path=panel_b_path,
+        panel_label="(b)",
+        analysis_name="Durability–Cost",
+    )
+
+    combine_panels(
+        left_path=panel_a_path,
+        right_path=panel_b_path,
+        output_path=combined_path,
+    )
+
+    transition_summary = build_transition_summary(
+        results,
+        dc_pareto,
+        dac_pareto,
+    )
+
+    summary_path = (
+        OUTPUT_DIR
+        / "Fig_S3_transition_summary.txt"
+    )
+
+    summary_path.write_text(
+        transition_summary,
+        encoding="utf-8",
+    )
+
+    print()
+    print(transition_summary)
+    print()
+    print("Files saved to:")
+    print(OUTPUT_DIR.resolve())
+    print()
+    print("Main combined figure:")
+    print(combined_path.resolve())
+
+
+if __name__ == "__main__":
+    main()
